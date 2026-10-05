@@ -6,3 +6,24 @@ keep_vars = true
 #[[kv_namespaces]]
 #binding = "KV"			#KV绑定名默认不可修改
 #id = ""				#KV数据库id
+
+# ===== Durable Object：隧道计算下沉，绕过免费版 Worker 10ms CPU 限制 =====
+# 只有 WebSocket 隧道流量会进 DO；KV、/sub、/admin、伪装页仍留在 Worker 里跑。
+[durable_objects]
+bindings = [
+  { name = "TUNNEL_DO", class_name = "TunnelDO" }
+]
+
+# 首次部署必须带上；免费版只允许 SQLite 存储后端的 DO。
+# 部署成功后可以删掉这一段，后续部署不再需要（删掉前请确认 DO 命名空间已创建）。
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TunnelDO"]
+
+[vars]
+# DO 放置区域（决定隧道出口 IP 所在大区）：wnam/enam/sam/weur/eeur/apac/oc/afr/me
+# 注意：locationHint 只在 DO 首次实例化时生效，之后改这个值无效，必须删除 DO 命名空间重建。
+DO_REGION = "wnam"
+# DO 分片数：1 = 所有隧道连接共用一个 DO（出口 IP 最稳、duration 计费最省，推荐先跑 1）
+#           >1 = 分散到多个 DO，并发更均匀，但 duration 按对象分别累计，可能更快吃满免费额度
+DO_SHARDS = "1"

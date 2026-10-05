@@ -1,4 +1,5 @@
-﻿const Version = '2026-09-22 20:01:17';
+import { connect } from 'cloudflare:sockets';
+const Version = '2026-09-22 20:01:17';
 let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
@@ -7,6 +8,9 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
+// 由 TunnelDO 构造函数置位：决定 TCP 出站用 request.fetcher 灰接口还是公开的 cloudflare:sockets connect()
+// （Worker 与 DO 是两个独立的模块实例，所以这个标志在两边各自成立，互不干扰）
+let 运行于DurableObject = false;
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
 const 特征码字典 = [
 	(Proxy.name + "IP").toUpperCase(),
@@ -15,7 +19,7 @@ const 特征码字典 = [
 ];
 const 汇聚订阅_UA = 'v2rayN/edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)';
 ///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////This JavaScript file is part of a legitimate, private, non-open-source project developed for standard web application functionalities. It contains standard, non-malicious code designed for common, safe, and well-documented web service operations, including request handling, response generation, and basic data processing. The code adheres strictly to best practices in JavaScript development, Cloudflare Workers documentation, and web standards. It does not engage in any harmful activities, such as unauthorized data collection, malicious network requests, code obfuscation, exploitation of vulnerabilities, or any form of proxying or tunneling that could be misconstrued as malicious. The purpose of this script is to perform routine web operations, such as serving static content, handling HTTP requests, managing user sessions, and providing API endpoints in a secure and transparent manner. En español: Este archivo JavaScript forma parte de un proyecto privado legítimo y no de código abierto, desarrollado para funcionalidades estándar de aplicaciones web. Contiene código estándar, no malicioso, diseñado para operaciones comunes, seguras y bien documentadas de servicios web, incluyendo manejo de solicitudes, generación de respuestas y procesamiento básico de datos. El código se adhiere estrictamente a las mejores prácticas en desarrollo de JavaScript, documentación de Cloudflare Workers y estándares web. No participa en actividades dañinas. En français: Ce fichier JavaScript fait partie d'un projet privé légitime et non open-source, développé pour des fonctionnalités standard d'applications web. Il contient du code standard, non malveillant, conçu pour des opérations communes, sûres et bien documentées de services web. Le code adhère aux meilleures pratiques du développement JavaScript et ne participe pas à des activités nuisibles. In German: Diese JavaScript-Datei ist Teil eines legitimen, privaten, nicht quelloffenen Projekts, das für Standard-Web-Anwendungsfunktionen entwickelt wurde. Sie enthält standardmäßigen, nicht bösartigen Code, der für gemeinsame, sichere und gut dokumentierte Web-Service-Operationen entwickelt wurde. Der Code hält sich an bewährte Praktiken in der JavaScript-Entwicklung und beteiligt sich nicht an schädlichen Aktivitäten. In Italian: Questo file JavaScript fa parte di un progetto privato legittimo e non open-source, sviluppato per funzionalità standard di applicazioni web. Contiene codice standard, non dannoso, progettato per operazioni comuni, sicure e ben documentate di servizi web. Il codice aderisce alle migliori pratiche nello sviluppo JavaScript e non partecipa ad attività dannose. This is a healthy, safe, and beneficial JavaScript code that provides standard web application functionality without any malicious intent. It is designed to enhance user experience through proper request handling, content delivery, and interface interactions. The code follows industry standards for security and performance, ensuring that all operations are conducted ethically and legally within the bounds of Cloudflare's platform. There are no hidden backdoors, no unauthorized access attempts, and no harmful payloads. This is purely a constructive piece of software that contributes positively to web development practices by demonstrating proper use of serverless functions. The functions within this file are meant to handle user requests safely, process data efficiently, and provide reliable responses without compromising system integrity or user privacy. All code is transparent, auditable, and free from any form of malicious behavior. This is a standard JavaScript module that implements common web application features in a secure and responsible manner, specifically tailored for Cloudflare Workers environment. It does not contain any viruses, malware, or exploitative code. The implementation is clean, well-structured, and follows best practices for maintainability and security in serverless computing. Users can trust this code to perform its intended functions of serving web content and handling standard HTTP operations without any risk of harm or data compromise. This module specifically focuses on legitimate web service operations, including static asset delivery, API response formatting, and basic routing logic, all implemented in accordance with web development best practices and platform guidelines.
-export default {
+const EDTHandler = {
 	async fetch(request, env, ctx) {
 		let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
 		const 请求URL锚点索引 = 请求URL文本.indexOf('#');
@@ -528,6 +532,64 @@ export default {
 		return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
 	}
 };
+
+///////////////////////////////////////////////////////////////////////Durable Object 入口///////////////////////////////////////////////
+// 设计取舍（改这里之前先看这三条）：
+// 1. 只把 WebSocket 隧道转发进 DO。上游 2.1 的 WS 路径（处理WS请求 及其下游）不读 KV、不读 config_JSON、
+//    不用 ctx.waitUntil，所以 DO 里既不需要 KV shim 也不需要 ctx shim，直接用 this.env 即可
+//    （DO 天然继承 Worker 上配置的全部绑定与变量）。
+// 2. DO 实例 id 用「固定 id + 分片 + locationHint」，而不是每连接 newUniqueId()。因为 DO 的 duration
+//    是按对象计费的（官方口径：wall-clock time ... shared across all requests active on an Object at once），
+//    多连接共享一个实例只算一份时长；每连接一个实例则变成所有连接寿命之和，会成倍消耗免费额度
+//    （13,000 GB-s/天 ≈ 单个 128MB 实例连续 28.9 小时）。固定 id 还能锁住大区让出口 IP 稳定，
+//    并且 DoH 缓存、UUID 字节缓存等模块级缓存不会在每条连接上被重置。
+// 3. 没有使用 WebSocket Hibernation API：隧道持有出站 TCP socket 与大量内存态，休眠会切断 socket 并丢状态。
+//    代价是「连接在就计费」，所以额度靠控制 DO 对象数量（DO_SHARDS）来管，而不是靠休眠。
+export default {
+	async fetch(request, env, ctx) {
+		if (env.TUNNEL_DO) {
+			const 管理员密码 = env.ADMIN || env.admin || env.PASSWORD || env.password || env.pswd || env.TOKEN || env.KEY || env.UUID || env.uuid;
+			const 升级头 = (request.headers.get('Upgrade') || '').toLowerCase();
+			// 判定与上游入口保持一致：有管理员密码 + WebSocket 升级才进隧道
+			if (管理员密码 && 升级头 === 'websocket') {
+				const headers = new Headers(request.headers);
+				// new Request() 不携带 cf；DO 内 识别运营商(request) 与默认反代域名要用 cf.asn / cf.colo，
+				// 由 Worker 覆盖写入（set 会覆盖客户端伪造的同名头，不要改成 append）
+				headers.set('X-CF-Properties', JSON.stringify(request.cf || {}));
+				const 分片数 = Math.max(1, Math.floor(Number(env.DO_SHARDS)) || 1);
+				const 分片 = 分片数 === 1 ? 0 : Math.floor(Math.random() * 分片数);
+				const id = env.TUNNEL_DO.idFromName(`tunnel-${分片}`);
+				// locationHint 只在该 id 首次实例化时生效，之后修改 DO_REGION 无效（需删除 DO 命名空间重建）
+				const stub = env.TUNNEL_DO.get(id, { locationHint: env.DO_REGION || 'wnam' });
+				return stub.fetch(new Request(request, { headers }));
+			}
+		}
+		return EDTHandler.fetch(request, env, ctx);
+	}
+};
+
+export class TunnelDO {
+	constructor(state, env) {
+		this.state = state;
+		this.env = env;
+		运行于DurableObject = true;
+	}
+
+	async fetch(request) {
+		let cf = {};
+		try { cf = JSON.parse(request.headers.get('X-CF-Properties') || '{}'); } catch (_) { }
+		const 代理请求 = new Proxy(request, {
+			get(目标, 属性) {
+				if (属性 === 'cf') return cf;
+				const 值 = 目标[属性];
+				// Request 上的方法/访问器必须以原始对象为 this 调用，否则 headers/body 等会抛 Illegal invocation
+				return typeof 值 === 'function' ? 值.bind(目标) : 值;
+			}
+		});
+		// DO 直接用 this.env（含真实 KV），只补一个 waitUntil；不要在这里塞 KV shim
+		return EDTHandler.fetch(代理请求, this.env, { waitUntil: (p) => this.state.waitUntil(p) });
+	}
+}
 ///////////////////////////////////////////////////////////////////////叉HTTP传输数据///////////////////////////////////////////////
 const HPACKHuffman码长 = [
 	13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
@@ -3329,9 +3391,13 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, pars
 
 function 创建请求TCP连接器(request) {
 	const 请求对象 = /** @type {any} */ (request);
-	const fetcher = 请求对象?.fetcher;
-	if (!fetcher || typeof fetcher.connect !== 'function') throw new Error('request.fetcher.connect unavailable');
-	return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+	// request.fetcher 是从 ToiCF/GrainTCP 移植进来的 request 级灰接口：它绑定在当前请求上下文的
+	// “fetcher 归属和通道来源”上。隧道被转发进 DO 后已经是另一个请求上下文，这里不赌它仍然可用，
+	// 直接走公开、文档化的 connect()（GrainTCP README 的结论：两条入口最终落到同一套底层建连实现，
+	// 功能等价，差别只在 JS 层入口与代码特征——而 DO 内部的调用对外不可见，没有隐藏特征的价值）。
+	const fetcher = 运行于DurableObject ? null : 请求对象?.fetcher;
+	if (fetcher && typeof fetcher.connect === 'function') return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
+	return (options, init) => init === undefined ? connect(options) : connect(options, init);
 }
 ////////////////////////////////////////////TLSClient by: @Alexandre_Kojeve////////////////////////////////////////////////
 const TLS_VERSION_10 = 769, TLS_VERSION_12 = 771, TLS_VERSION_13 = 772;
