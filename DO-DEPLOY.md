@@ -7,7 +7,7 @@ Durable Object，绕过免费版 Worker 的 10ms CPU 限制（DO 为 30s/请求�
 
 | 文件 | 改动 |
 | :--- | :--- |
-| `_worker.js` | ① 顶部新增 `import { connect } from 'cloudflare:sockets'`（见下文"已知注意点"）② 原 `export default` 改名为 `const EDTHandler`，函数体未改动 ③ 新增薄 Worker 入口：只把 `Upgrade: websocket` 且配置了管理员密码的请求转发进 DO ④ 新增 `export class TunnelDO` ⑤ `创建请求TCP连接器()` 增加标准 `connect()` 兜底 |
+| `_worker.js` | 只有两处：① 原 `export default` 改名成 `const EDTHandler`，函数体一字未改 ② 其后新增薄 Worker 入口（只把 `Upgrade: websocket` 且配置了管理员密码的请求转发进 DO）与 `export class TunnelDO`。**其余部分与上游逐字节一致**，包括 `创建请求TCP连接器()` |
 | `wrangler.toml` | 新增 `[durable_objects]` 绑定、`[[migrations]]`、`[vars]` 的 `DO_REGION` / `DO_SHARDS` |
 
 **没有改动的东西**：KV 绑定、`/sub`、`/login`、`/admin/*`、伪装页、gRPC/XHTTP 全部仍留在 Worker 里跑。
@@ -66,18 +66,28 @@ Dashboard 的 Duration 用量再决定要不要分片。
 
 ## 已知注意点
 
-1. **TCP 出站入口分了两条路**：上游 2.1 建 TCP 用的是 `request.fetcher.connect()`——这是从
-   [ToiCF/GrainTCP](https://github.com/ToiCF/GrainTCP) 移植来的 **request 级未公开灰接口**（GrainTCP README
-   原话：与公开 `cloudflare:sockets.connect()` 的差异"主要在 JS 层入口、**fetcher 归属和通道来源**"，
-   两者最终落到同一套底层建连实现）。GrainTCP 自己没有任何兜底，也完全没有用到 DO，所以"转发进 DO 后
-   `request.fetcher` 是否仍可用"没有现成结论。
-   本改造因此按上下文区分：
-   - **Worker 内**：仍然优先用 `request.fetcher`（保留它"代码特征更小"的价值）；
-   - **DO 内**：TunnelDO 的构造函数把模块级标志 `运行于DurableObject` 置位，`创建请求TCP连接器()`
-     直接改走公开、文档化的 `connect()`——不赌灰接口在新请求上下文里的归属，功能等价。
-   （Worker 与 DO 是两个独立的模块实例，标志互不影响；即使假设不成立，最坏结果也只是退回公开 API。）
-   代价：文件顶部多了一行 `import { connect } from 'cloudflare:sockets'`，这是一个明显的特征串。
-   如果你能确认 DO 内 `request.fetcher` 可用并愿意赌它，可以删掉这行 import 与 DO 分支。
+1. **DO 内 `request.fetcher` 已确认可用，所以没有引入任何 import**。上游 2.1 建 TCP 用的是
+   `request.fetcher.connect()`——从 [ToiCF/GrainTCP](https://github.com/ToiCF/GrainTCP) 移植的
+   request 级未公开灰接口（GrainTCP 自己是零兜底，也完全没有用到 DO）。我们读 workerd 源码确认了它
+   在 Durable Object 里同样存在：
+   - `fetcher` 是 `Request` 上的只读属性：`src/workerd/api/http.h` 里
+     `JSG_READONLY_PROTOTYPE_PROPERTY(fetcher, getFetcher)` / `JSG_READONLY_INSTANCE_PROPERTY(...)`；
+   - 入口 Request 由 `ServiceWorkerGlobalScope::request()` 构造，其中挂上去的 `defaultFetcher`
+     是该 global scope 的惰性成员（`src/workerd/api/global-scope.h`：`kj::Maybe<jsg::Ref<Fetcher>> defaultFetcher`），
+     被**无条件**附加到每一个入口请求上，且写死为 `IoContext::NEXT_CLIENT_CHANNEL`；
+   - DO（actor）请求走的是**同一个** `WorkerEntrypoint::request()` → `lock.getGlobalScope().request(...)`；
+     该函数里的 `isActor` 只用于异常映射与错误处理（`worker-entrypoint.c++` 的 552/667/677/839 行），
+     **不在分发处分叉**；
+   - `request.fetcher.connect()` 与 `cloudflare:sockets` 的 `connect()` 最终都进同一个 `connectImpl`
+     （`src/workerd/api/sockets.c++`；前者传 `JSG_THIS`，后者传 `kj::none` 后落到 `NULL_CLIENT_CHANNEL`），
+     只差一个 subrequest channel 编号，而 `io-context.h` 的注释明确写着 NEXT 已废弃、
+     "we don't plan to treat NEXT and NULL differently going forward"。
+
+   因此 `创建请求TCP连接器()` **保持上游原样**，只用 `request.fetcher`——不需要
+   `import { connect } from 'cloudflare:sockets'`，少一个明显的特征串，也少一处与上游的冲突点。
+   （workerd 是在 `Release 2026-10-05` / `34c69bf` 上核对的；这份结论来自开放源码，Cloudflare
+   边缘侧的内嵌版本无法直接验证，上线时用 `wrangler tail` 留意
+   `request.fetcher.connect unavailable` 即可。）
 2. **`X-CF-Properties`**：`new Request()` 不携带 `cf`，而 DO 内需要 `cf.colo`（拼默认反代域名）和
    `cf.asn`（`识别运营商`），所以由 Worker 覆盖写入该头。不要改成 `append`，否则客户端可以伪造。
 3. **命名 DO 首次访问延迟**：官方说明基于名字的 DO 首次 `get()` 需要做一次"全球是否已存在同名实例"的检查，

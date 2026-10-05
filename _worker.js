@@ -1,5 +1,4 @@
-import { connect } from 'cloudflare:sockets';
-const Version = '2026-09-22 20:01:17';
+﻿const Version = '2026-09-22 20:01:17';
 let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
@@ -8,9 +7,6 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
-// 由 TunnelDO 构造函数置位：决定 TCP 出站用 request.fetcher 灰接口还是公开的 cloudflare:sockets connect()
-// （Worker 与 DO 是两个独立的模块实例，所以这个标志在两边各自成立，互不干扰）
-let 运行于DurableObject = false;
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
 const 特征码字典 = [
 	(Proxy.name + "IP").toUpperCase(),
@@ -572,7 +568,6 @@ export class TunnelDO {
 	constructor(state, env) {
 		this.state = state;
 		this.env = env;
-		运行于DurableObject = true;
 	}
 
 	async fetch(request) {
@@ -3391,13 +3386,9 @@ async function httpsConnect(targetHost, targetPort, initialData, TCP连接, pars
 
 function 创建请求TCP连接器(request) {
 	const 请求对象 = /** @type {any} */ (request);
-	// request.fetcher 是从 ToiCF/GrainTCP 移植进来的 request 级灰接口：它绑定在当前请求上下文的
-	// “fetcher 归属和通道来源”上。隧道被转发进 DO 后已经是另一个请求上下文，这里不赌它仍然可用，
-	// 直接走公开、文档化的 connect()（GrainTCP README 的结论：两条入口最终落到同一套底层建连实现，
-	// 功能等价，差别只在 JS 层入口与代码特征——而 DO 内部的调用对外不可见，没有隐藏特征的价值）。
-	const fetcher = 运行于DurableObject ? null : 请求对象?.fetcher;
-	if (fetcher && typeof fetcher.connect === 'function') return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
-	return (options, init) => init === undefined ? connect(options) : connect(options, init);
+	const fetcher = 请求对象?.fetcher;
+	if (!fetcher || typeof fetcher.connect !== 'function') throw new Error('request.fetcher.connect unavailable');
+	return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
 }
 ////////////////////////////////////////////TLSClient by: @Alexandre_Kojeve////////////////////////////////////////////////
 const TLS_VERSION_10 = 769, TLS_VERSION_12 = 771, TLS_VERSION_13 = 772;
